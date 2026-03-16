@@ -8,7 +8,7 @@ from typing import Any, Dict, List
 import pandas as pd
 import streamlit as st
 
-from storage_apps_script import Actor
+from storage_apps_script import Actor, AppsScriptStorage
 from cache_utils import (
     delete_saved_file,
     load_local_travel_records,
@@ -24,8 +24,17 @@ from cache_utils import (
     queue_pending_sync,
     load_options_cache,
     load_users_cache,
+    save_cloud_backup_excel,
+    archive_deleted_record,
+    delete_local_travel_record,
+    load_deleted_archive_rows,
+    mark_deleted_archive_restored,
+    remove_pending_sync_item,
+    list_pending_conflicts,
 )
 import pdf_gen_travel
+from shared_plan_options import get_shared_plan_code_options
+from sync_engine import build_master_dataframe, sync_pending_events
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 TRAVEL_CONFIG_PATH = BASE_DIR / "data" / "travel_config.json"
@@ -40,9 +49,24 @@ def _read_json(path: Path) -> dict:
         return {}
 
 
+
+def _get_web_app_url() -> str:
+    cfg = _read_json(TRAVEL_CONFIG_PATH)
+    secrets = st.secrets if hasattr(st, "secrets") else {}
+    return (
+        cfg.get("google", {}).get("apps_script_url")
+        or secrets.get("APPS_SCRIPT_WEB_APP_URL", "")
+    ).strip()
+
+
 def _get_cloud_excel_url() -> str:
     cfg = _read_json(TRAVEL_CONFIG_PATH)
     return str(cfg.get("ui", {}).get("cloud_excel_url", "")).strip()
+
+
+@st.cache_resource(show_spinner=False)
+def get_api() -> AppsScriptStorage:
+    return AppsScriptStorage(web_app_url=_get_web_app_url(), system="travel", timeout=20)
 
 
 def _df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "travel") -> bytes:
@@ -50,6 +74,30 @@ def _df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "travel") -> bytes:
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         (df.copy() if df is not None else pd.DataFrame()).to_excel(writer, sheet_name=sheet_name[:31], index=False)
+    bio.seek(0)
+    return bio.getvalue()
+
+
+def _split_travel_export_frames(actor: Actor) -> tuple[pd.DataFrame, pd.DataFrame]:
+    all_df = list_records(actor)
+    if not isinstance(all_df, pd.DataFrame) or all_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    df = all_df.copy().fillna("")
+    if "status" not in df.columns:
+        df["status"] = "draft"
+    status_series = df["status"].astype(str).str.lower()
+    draft_df = df[status_series.isin(["draft", "deleted"])].copy()
+    submitted_df = df[status_series.isin(["submitted", "void"])].copy()
+    return draft_df, submitted_df
+
+
+def _build_travel_workbook_bytes(actor: Actor) -> bytes:
+    from io import BytesIO
+    draft_df, submitted_df = _split_travel_export_frames(actor)
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        submitted_df.to_excel(writer, sheet_name="申請列表", index=False)
+        draft_df.to_excel(writer, sheet_name="草稿列表", index=False)
     bio.seek(0)
     return bio.getvalue()
 
@@ -73,6 +121,8 @@ def _option_candidates(grouped: dict[str, list[str]], *keys: str) -> list[str]:
         for v in grouped.get(key, []):
             if v not in out:
                 out.append(v)
+    if any(key in {"plan_code", "project_id"} for key in keys):
+        return get_shared_plan_code_options(out, include_other=True)
     return out
 
 
@@ -184,6 +234,197 @@ def list_records(actor: Actor) -> pd.DataFrame:
     return df
 
 
+def _travel_archive_restore_status(row: Dict[str, Any]) -> str:
+    status = str((row or {}).get("status", "")).strip().lower()
+    return "submitted" if status in {"submitted", "void"} else "draft"
+
+
+def _travel_restore_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(row or {})
+    for k in [
+        "archive_system_type", "archive_actor_email", "archived_at", "archive_id",
+        "archive_restored", "restored_at", "restored_by", "restore_target_status",
+    ]:
+        payload.pop(k, None)
+    payload["status"] = _travel_archive_restore_status(row)
+    return payload
+
+
+def _render_deleted_archive_restore_travel(actor: Actor) -> None:
+    if str(actor.role).lower() != "admin":
+        return
+    rows = load_deleted_archive_rows(system_type="travel", include_restored=False)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("deleted archive 還原")
+    if not rows:
+        st.sidebar.info("目前沒有可還原的出差刪除備份。")
+        return
+    options: Dict[str, Dict[str, Any]] = {}
+    labels: List[str] = []
+    for row in rows[:100]:
+        rid = str(row.get("record_id", "")).strip() or "(無編號)"
+        owner = str(row.get("user_email", "")).strip().lower()
+        archived_at = str(row.get("archived_at", "")).strip()
+        raw_status = str(row.get("status", "")).strip().lower()
+        restore_status = _travel_archive_restore_status(row)
+        label = f"{rid}｜{owner or '-'}｜原狀態:{raw_status or '-'} → 還原為:{restore_status}｜{archived_at}"
+        labels.append(label)
+        options[label] = row
+    selected = st.sidebar.selectbox("選擇要還原的出差紀錄", labels, key="travel_archive_restore_select")
+    selected_row = options.get(selected) if selected else None
+    if selected_row and st.sidebar.button("一鍵還原出差紀錄", key="travel_archive_restore_btn", use_container_width=True):
+        payload = _travel_restore_payload(selected_row)
+        target_status = str(payload.get("status", "draft")).strip().lower() or "draft"
+        owner_email = str(payload.get("user_email") or actor.email or "").strip().lower()
+        upsert_local_travel_record(owner_email, payload)
+        ok, msg = _queue_and_try_sync_travel(actor, f'travel_restore_{target_status}', payload)
+        mark_deleted_archive_restored(str(selected_row.get("archive_id", "")), restored_by=actor.email, restore_target_status=target_status)
+        if ok:
+            st.sidebar.success(f"已還原：{payload.get('record_id','')}")
+        else:
+            st.sidebar.warning(f"已加入待同步還原：{msg or '請稍後重新同步'}")
+        st.rerun()
+
+
+
+
+def _queue_and_try_sync_travel(actor: Actor, operation: str, payload: Dict[str, Any]) -> tuple[bool, str]:
+    payload = dict(payload or {})
+    payload['system_type'] = 'travel'
+    payload['user_email'] = str(payload.get('user_email') or actor.email or '').strip().lower()
+    queue_pending_sync(operation, {'email': actor.email, 'name': actor.name, 'role': actor.role}, payload, queue_owner_email=payload['user_email'])
+    try:
+        result = sync_pending_events('travel', actor, get_api())
+        if result.get('conflicts', 0) > 0:
+            st.session_state['cloud_online_travel'] = False
+            return False, f"VERSION_CONFLICT {result.get('conflicts', 0)} 筆"
+        if result.get('failed', 0) == 0:
+            st.session_state['cloud_online_travel'] = True
+            return True, ''
+        st.session_state['cloud_online_travel'] = False
+        return False, f"仍有 {result.get('remaining', 0)} 筆待同步"
+    except Exception as exc:
+        st.session_state['cloud_online_travel'] = False
+        return False, str(exc)
+
+
+def _travel_conflict_items(actor: Actor) -> List[Dict[str, Any]]:
+    return list_pending_conflicts(actor.email, system_type='travel')
+
+
+def _travel_force_cloud_reload(actor: Actor, item: Dict[str, Any]) -> tuple[bool, str]:
+    payload = dict((item or {}).get('payload') or {})
+    record_id = str(payload.get('record_id') or '').strip()
+    event_id = str((item or {}).get('event_id') or payload.get('event_id') or '').strip()
+    try:
+        df = get_api().records_df(actor=actor, status=None, owner_only=False).fillna('')
+        if df.empty or 'record_id' not in df.columns:
+            raise ValueError('雲端查無該筆紀錄')
+        matched = df[df['record_id'].astype(str) == record_id]
+        if matched.empty:
+            raise ValueError(f'雲端查無 record_id={record_id}')
+        cloud_row = matched.iloc[-1].to_dict()
+        owner_email = str(cloud_row.get('user_email') or actor.email or '').strip().lower()
+        upsert_local_travel_record(owner_email, cloud_row)
+        remove_pending_sync_item(actor.email, event_id=event_id)
+        return True, '已採用雲端版本並移除本機衝突事件'
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _travel_force_override(actor: Actor, item: Dict[str, Any]) -> tuple[bool, str]:
+    payload = dict((item or {}).get('payload') or {})
+    conflict = dict(payload.get('sync_conflict') or {})
+    current_version = conflict.get('current_version')
+    if current_version in (None, ''):
+        return False, '缺少雲端 current_version，無法強制覆蓋'
+    try:
+        ver = int(current_version)
+    except Exception:
+        return False, f'current_version 無法解析：{current_version}'
+    payload['expected_version'] = ver
+    payload['base_version'] = ver
+    payload['version'] = ver
+    payload['updated_at'] = datetime.now().isoformat(timespec='seconds')
+    payload['needs_sync'] = True
+    payload['sync_status'] = 'pending'
+    payload['sync_message'] = ''
+    payload.pop('sync_conflict', None)
+    operation = str((item or {}).get('operation') or 'travel_draft')
+    remove_pending_sync_item(actor.email, event_id=str((item or {}).get('event_id') or payload.get('event_id') or '').strip())
+    ok, msg = _queue_and_try_sync_travel(actor, operation, payload)
+    return ok, (msg or ('已重新送出覆蓋事件' if ok else '重新送出失敗'))
+
+
+def _travel_save_as_copy(actor: Actor, item: Dict[str, Any]) -> tuple[bool, str]:
+    payload = dict((item or {}).get('payload') or {})
+    operation = str((item or {}).get('operation') or 'travel_draft').lower()
+    owner_email = str(payload.get('user_email') or actor.email or '').strip().lower()
+    old_record_id = str(payload.get('record_id') or '').strip()
+    new_payload = dict(payload)
+    for k in ['record_id','event_id','expected_version','base_version','version','sync_conflict','last_event_id','sync_message']:
+        new_payload.pop(k, None)
+    new_payload['updated_at'] = datetime.now().isoformat(timespec='seconds')
+    new_payload['status'] = 'submitted' if ('submit' in operation or str(payload.get('status') or '').strip().lower() == 'submitted') else 'draft'
+    new_id = upsert_local_travel_record(owner_email, new_payload)
+    new_payload['record_id'] = new_id
+    remove_pending_sync_item(actor.email, event_id=str((item or {}).get('event_id') or payload.get('event_id') or '').strip())
+    ok, msg = _queue_and_try_sync_travel(actor, 'travel_submit' if new_payload['status']=='submitted' else 'travel_draft', new_payload)
+    if ok:
+        return True, f'已另存新版本：{old_record_id} → {new_id}'
+    return False, f'已另存新版本 {new_id}，但尚未完成同步：{msg or "請稍後重試"}'
+
+
+def _render_version_conflicts_travel(actor: Actor) -> None:
+    items = _travel_conflict_items(actor)
+    if not items:
+        return
+    st.sidebar.markdown('---')
+    st.sidebar.subheader('版本衝突處理')
+    st.sidebar.error(f'目前有 {len(items)} 筆 VERSION_CONFLICT 需要人工處理。')
+    labels: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for item in items[:100]:
+        payload = dict(item.get('payload') or {})
+        conflict = dict(payload.get('sync_conflict') or {})
+        rid = str(payload.get('record_id') or '(新資料)')
+        cur = str(conflict.get('current_version') or '?')
+        exp = str(conflict.get('expected_version') or payload.get('expected_version') or payload.get('base_version') or payload.get('version') or '?')
+        upd = str(conflict.get('updated_by') or '-')
+        label = f"{rid}｜cloud:{cur}｜local:{exp}｜updated_by:{upd}"
+        order.append(label)
+        labels[label] = item
+    selected_label = st.sidebar.selectbox('選擇要處理的出差衝突', order, key='travel_conflict_select')
+    selected = labels.get(selected_label) if selected_label else None
+    if not selected:
+        return
+    payload = dict(selected.get('payload') or {})
+    conflict = dict(payload.get('sync_conflict') or {})
+    st.sidebar.caption(f"record_id={payload.get('record_id','')}｜event_id={selected.get('event_id','')}")
+    st.sidebar.caption(f"雲端版本={conflict.get('current_version','?')}｜本機版本={conflict.get('expected_version', payload.get('expected_version', payload.get('version','?')))}")
+    if conflict.get('updated_at') or conflict.get('updated_by'):
+        st.sidebar.caption(f"雲端最後更新：{conflict.get('updated_at','')} {conflict.get('updated_by','')}")
+    st.sidebar.info('處理方式：1 採用雲端版本 2 強制覆蓋雲端 3 另存成新版本。')
+    c1, c2 = st.sidebar.columns(2)
+    if c1.button('採用雲端版本', key='travel_conflict_reload', use_container_width=True):
+        ok, msg = _travel_force_cloud_reload(actor, selected)
+        if ok:
+            st.sidebar.success(msg)
+            st.rerun()
+        st.sidebar.error(msg)
+    if c2.button('強制覆蓋送出', key='travel_conflict_override', use_container_width=True):
+        ok, msg = _travel_force_override(actor, selected)
+        if ok:
+            st.sidebar.success(msg)
+            st.rerun()
+        st.sidebar.error(msg)
+    if st.sidebar.button('另存成新版本', key='travel_conflict_savecopy', use_container_width=True):
+        ok, msg = _travel_save_as_copy(actor, selected)
+        if ok:
+            st.sidebar.success(msg)
+            st.rerun()
+        st.sidebar.warning(msg)
+
 def render_sync_status_sidebar_travel(current_user_email: str) -> None:
     if not current_user_email:
         return
@@ -197,6 +438,9 @@ def render_sync_status_sidebar_travel(current_user_email: str) -> None:
         st.sidebar.error("雲端：未連線")
     if pending_count > 0:
         st.sidebar.warning(f"你有 {pending_count} 筆出差資料尚未同步到雲端")
+    conflict_count = len(_travel_conflict_items(get_current_actor() or Actor(name='', email=current_user_email, role='user')))
+    if conflict_count > 0:
+        st.sidebar.error(f"其中有 {conflict_count} 筆需要處理 VERSION_CONFLICT")
     else:
         st.sidebar.success("你的出差資料皆已同步")
 
@@ -204,40 +448,42 @@ def render_sync_status_sidebar_travel(current_user_email: str) -> None:
     if cloud_url:
         st.sidebar.link_button("開啟雲端表單", cloud_url, use_container_width=True)
 
-    export_df = st.session_state.get("travel_sidebar_export_df")
-    if isinstance(export_df, pd.DataFrame):
-        st.sidebar.download_button(
-            "下載Excel",
-            data=_df_to_excel_bytes(export_df, sheet_name="travel"),
-            file_name="出差報帳.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key="travel_sidebar_download_excel",
-        )
+    actor = get_current_actor() or Actor(name="", email=current_user_email, role="user")
+    draft_cloud_df, submitted_cloud_df = _split_travel_export_frames(actor)
+    save_cloud_backup_excel({"申請列表": submitted_cloud_df, "草稿列表": draft_cloud_df}, filename="travel_cloud_backup.xlsx")
+    st.sidebar.download_button(
+        "下載Excel",
+        data=_build_travel_workbook_bytes(actor),
+        file_name="出差報帳.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="travel_sidebar_download_excel",
+    )
+
+    _render_deleted_archive_restore_travel(get_current_actor() or Actor(name="", email=current_user_email, role="user"))
+
+    report = st.session_state.get('travel_sync_report', {}) or {}
+    st.sidebar.caption(f"master={report.get('master_count', 0)}｜cloud={report.get('cloud_count', 0)}｜pending={report.get('pending_count', 0)}")
+    if report.get('cloud_count', 0) != report.get('master_count', 0) and report.get('pending_count', 0) == 0:
+        st.sidebar.warning('偵測到雲端與前端筆數不一致，建議重新同步或重新整理。')
+
+    _render_version_conflicts_travel(get_current_actor() or Actor(name='', email=current_user_email, role='user'))
 
     if st.sidebar.button("立即同步出差資料", key="sync_travel_now_btn", use_container_width=True):
-        pending_items = load_pending_sync(current_user_email)
-        synced = 0
-        failed = 0
-        for item in pending_items:
-            payload = dict(item.get("payload") or item)
-            system_type = payload.get("system_type") or ("travel" if "travel" in str(item.get("operation", "")).lower() else "expense")
-            if system_type != "travel":
-                continue
-            record_id = str(payload.get("record_id") or "").strip()
-            try:
-                # TODO: replace with real cloud API call if available in your environment.
-                mark_sync_success(current_user_email, "travel", record_id)
-                synced += 1
-            except Exception as e:
-                mark_sync_failed(current_user_email, "travel", record_id, str(e))
-                failed += 1
-        if synced == 0 and failed == 0:
-            st.sidebar.info("目前沒有待同步的出差資料。")
-        elif failed == 0:
-            st.sidebar.success(f"同步完成：{synced} 筆")
-        else:
-            st.sidebar.warning(f"同步完成：成功 {synced} 筆，失敗 {failed} 筆")
+        try:
+            result = sync_pending_events('travel', get_current_actor() or Actor(name='', email=current_user_email, role='user'), get_api())
+            st.session_state['cloud_online_travel'] = result.get('failed', 0) == 0
+            if result.get('synced', 0) == 0 and result.get('failed', 0) == 0:
+                st.sidebar.info("目前沒有待同步的出差資料。")
+            elif result.get('conflicts', 0) > 0:
+                st.sidebar.error(f"同步完成：成功 {result.get('synced', 0)} 筆，版本衝突 {result.get('conflicts', 0)} 筆")
+            elif result.get('failed', 0) == 0:
+                st.sidebar.success(f"同步完成：{result.get('synced', 0)} 筆")
+            else:
+                st.sidebar.warning(f"同步完成：成功 {result.get('synced', 0)} 筆，失敗 {result.get('failed', 0)} 筆")
+        except Exception as e:
+            st.session_state['cloud_online_travel'] = False
+            st.sidebar.error(f"同步失敗：{e}")
 
 
 def render_top_sync_notice_travel(current_user_email: str) -> None:
@@ -246,6 +492,9 @@ def render_top_sync_notice_travel(current_user_email: str) -> None:
     pending_count = count_pending_sync(current_user_email, system_type="travel")
     if pending_count > 0:
         st.info(f"提醒：你有 {pending_count} 筆出差資料尚未同步到雲端。")
+    conflict_count = len(_travel_conflict_items(get_current_actor() or Actor(name='', email=current_user_email, role='user')))
+    if conflict_count > 0:
+        st.error(f"注意：目前有 {conflict_count} 筆出差資料發生 VERSION_CONFLICT，請到側邊欄處理。")
 
 
 def persist_uploads(actor: Actor, payload: Dict[str, Any], uploads: list | None, signature_upload) -> Dict[str, Any]:
@@ -319,8 +568,16 @@ def render_form(actor: Actor) -> None:
         employee_val = c3.selectbox("工號", employee_options, index=employee_options.index(form.get("employee_no", actor.employee_no)) if form.get("employee_no", actor.employee_no) in employee_options else 0)
 
         c4, c5, c6, c7 = st.columns(4)
-        project_val = c4.selectbox("計畫編號", project_options, index=project_options.index(form.get("project_id", "")) if form.get("project_id", "") in project_options else 0)
+        current_project = str(form.get("project_id", "")).strip()
+        project_select_options = list(project_options) if list(project_options) else [""]
+        if "其他" not in project_select_options:
+            project_select_options.append("其他")
+        project_select_default = current_project if current_project in project_select_options else ("其他" if current_project else project_select_options[0])
+        project_choice = c4.selectbox("計畫編號", project_select_options, index=project_select_options.index(project_select_default))
         budget_val = c5.selectbox("預算來源", budget_options, index=budget_options.index(form.get("budget_source", "")) if form.get("budget_source", "") in budget_options else 0)
+        project_other_val = ""
+        if project_choice == "其他":
+            project_other_val = st.text_input("計畫編號（其他）", value=current_project if current_project not in project_options else "")
 
         dep_default = form.get("departure_location", "台南") if form.get("departure_location", "台南") in departure_options else "其他"
         dest_default = form.get("destination_location", "台北") if form.get("destination_location", "台北") in destination_options else "其他"
@@ -340,18 +597,11 @@ def render_form(actor: Actor) -> None:
         end_val = d2.date_input("結束日期", value=datetime.fromisoformat(str(form.get("end_date", date.today().isoformat()))).date())
 
         transport_val = st.multiselect("交通方式", transport_opts, default=[x for x in form.get("transport_options", []) if x in transport_opts])
-        official_plate_val = ""
-        private_km_val = 0
-        private_plate_val = ""
-        other_transport_val = ""
-        if "公務車" in transport_val:
-            official_plate_val = st.text_input("公務車車號", value=str(form.get("official_car_plate", "")))
-        if "私車公用" in transport_val:
-            p1, p2 = st.columns(2)
-            private_km_val = p1.number_input("私車公里數", min_value=0, step=1, value=safe_int(form.get("private_car_km", 0)))
-            private_plate_val = p2.text_input("私車車號", value=str(form.get("private_car_plate", "")))
-        if "其他" in transport_val:
-            other_transport_val = st.text_input("其他交通工具說明", value=str(form.get("other_transport", "")))
+        tf1, tf2, tf3, tf4 = st.columns(4)
+        private_km_val = tf1.number_input("私車公用里程數", min_value=0, step=1, value=safe_int(form.get("private_car_km", 0)))
+        private_plate_val = tf2.text_input("私車公用車號", value=str(form.get("private_car_plate", "")))
+        official_plate_val = tf3.text_input("公務車車號", value=str(form.get("official_car_plate", "")))
+        other_transport_val = tf4.text_input("其他交通方式", value=str(form.get("other_transport", "")))
 
         edited_df = st.data_editor(
             details_df,
@@ -395,7 +645,7 @@ def render_form(actor: Actor) -> None:
             "form_date": form_date_val.isoformat(),
             "traveler": traveler_val,
             "employee_no": employee_val,
-            "project_id": project_val,
+            "project_id": project_other_val.strip() if project_choice == "其他" else project_choice,
             "budget_source": budget_val,
             "purpose": purpose_val,
             "departure_location": dep_other if dep_choice == "其他" else dep_choice,
@@ -428,18 +678,26 @@ def render_form(actor: Actor) -> None:
             payload["status"] = "draft"
             rid = upsert_local_travel_record(actor.email, payload)
             payload["record_id"] = rid
-            queue_pending_sync("travel_draft", {"email": actor.email, "name": actor.name}, payload, queue_owner_email=actor.email)
             set_form(actor, payload)
+            ok, msg = _queue_and_try_sync_travel(actor, 'travel_draft', payload)
             st.session_state["travel_page"] = "drafts"
+            if ok:
+                st.success('草稿已儲存並同步。')
+            else:
+                st.warning(f"草稿已先保存在本機待同步：{msg or '請稍後重新同步'}")
             st.rerun()
 
         if submit_final:
             payload["status"] = "submitted"
             rid = upsert_local_travel_record(actor.email, payload)
             payload["record_id"] = rid
-            queue_pending_sync("travel_submit", {"email": actor.email, "name": actor.name}, payload, queue_owner_email=actor.email)
             set_form(actor, payload)
+            ok, msg = _queue_and_try_sync_travel(actor, 'travel_submit', payload)
             st.session_state["travel_page"] = "submitted"
+            if ok:
+                st.success('表單已送出並同步。')
+            else:
+                st.error(f"送出已保存在本機待同步：{msg or '請稍後重新同步'}")
             st.rerun()
 
         if make_pdf:
@@ -457,8 +715,12 @@ def render_form(actor: Actor) -> None:
 
         if delete_or_void:
             rid = str(form.get("record_id") or "")
+            target_status = "void" if str(form.get("status", "draft")).lower() in {"submitted", "void"} else "deleted"
             if rid:
-                mark_local_travel_status(actor.email, rid, "void" if str(form.get("status", "draft")).lower() in {"submitted", "void"} else "deleted")
+                mark_local_travel_status(actor.email, rid, target_status)
+                payload['record_id'] = rid
+                payload['status'] = target_status
+                _queue_and_try_sync_travel(actor, 'travel_soft_delete', payload)
             st.session_state["travel_page"] = "submitted" if str(form.get("status", "draft")).lower() in {"submitted", "void"} else "drafts"
             st.rerun()
 
@@ -603,7 +865,9 @@ def render_list(actor: Actor, title: str, statuses: List[str], key_prefix: str) 
         cols[5].write(rec.get("project_id", ""))
         cols[6].write(f"{safe_int(rec.get('amount_total')):,}")
         cols[7].write(str(rec.get("updated_at", ""))[:19])
-        actions = cols[8].columns(5)
+        actions = cols[8].columns(6)
+        record_id = str(rec.get("record_id") or "")
+        owner_email = str(rec.get("user_email") or actor.email or "").strip().lower()
         if actions[0].button("編輯", key=f"{key_prefix}_edit_{rec.get('record_id')}"):
             load_into_form(actor, rec, as_copy=False)
             st.rerun()
@@ -614,12 +878,34 @@ def render_list(actor: Actor, title: str, statuses: List[str], key_prefix: str) 
         actions[2].download_button("下載", data=pdf_bytes, file_name=f"出差報帳_{rec.get('record_id') or 'preview'}.pdf", mime="application/pdf", key=f"{key_prefix}_dl_{rec.get('record_id')}")
         if actions[3].button("送出", key=f"{key_prefix}_submit_{rec.get('record_id')}", disabled=str(rec.get("status")) in {"submitted", "void"}):
             rec["status"] = "submitted"
-            upsert_local_travel_record(actor.email, rec)
+            upsert_local_travel_record(owner_email, rec)
+            _queue_and_try_sync_travel(actor, 'travel_submit', rec)
             st.rerun()
         action_label = "作廢" if str(rec.get("status")) in {"submitted", "void"} else "刪除"
         if actions[4].button(action_label, key=f"{key_prefix}_del_{rec.get('record_id')}"):
-            mark_local_travel_status(actor.email, str(rec.get("record_id")), "void" if action_label == "作廢" else "deleted")
+            target_status = "void" if action_label == "作廢" else "deleted"
+            mark_local_travel_status(owner_email, record_id, target_status)
+            rec['status'] = target_status
+            _queue_and_try_sync_travel(actor, 'travel_soft_delete', rec)
             st.rerun()
+        confirm_key = f"travel_hard_delete_confirm::{record_id}"
+        if st.session_state.get(confirm_key):
+            if actions[5].button("確認移除", key=f"{key_prefix}_hard_yes_{record_id}"):
+                archive_deleted_record(rec, system_type="travel", actor_email=actor.email)
+                delete_local_travel_record(owner_email, record_id)
+                _queue_and_try_sync_travel(actor, 'travel_hard_delete', {'record_id': record_id, 'user_email': owner_email, 'system_type': 'travel'})
+                st.session_state.pop(confirm_key, None)
+                st.success(f"{record_id} 已永久移除。")
+                st.rerun()
+        elif str(actor.role).lower() == "admin" and actions[5].button("移除", key=f"{key_prefix}_hard_del_{record_id}"):
+            st.session_state[confirm_key] = True
+            st.warning("此操作會永久移除資料，且已先備份到 deleted archive。")
+            st.rerun()
+        if st.session_state.get(confirm_key):
+            c1, c2 = st.columns(2)
+            if c1.button("取消移除", key=f"{key_prefix}_hard_no_{record_id}"):
+                st.session_state.pop(confirm_key, None)
+                st.rerun()
 
     m = st.columns(5)
     for col, (label, value) in zip(m, list(totals.items()) + [("總金額總計", total_all)]):

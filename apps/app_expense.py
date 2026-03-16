@@ -1361,10 +1361,9 @@ def render_record_list_page(df: pd.DataFrame, title: str, source: str, grouped_o
         row_cols[7].markdown(f'<div class="exp-table-cell">{safe_int(rec.get("amount_total")):,}</div>', unsafe_allow_html=True)
         row_cols[8].markdown(f'<div class="exp-table-cell">{str(rec.get("purpose_desc", ""))}</div>', unsafe_allow_html=True)
         row_cols[9].markdown(f'<div class="exp-table-cell">{updated_text}</div>', unsafe_allow_html=True)
-        action_cols = row_cols[10].columns(6)
+        action_cols = row_cols[10].columns(5)
         pdf_payload = _record_to_pdf_payload(rec, actor)
         pdf_bytes = _prepare_pdf_bytes(pdf_payload)
-        owner_email = str(rec.get("user_email") or actor.email or "").strip().lower()
         if action_cols[0].button("編輯", key=f"{key_prefix}_edit_{record_id}", use_container_width=True):
             load_record_into_form(rec, actor, grouped_options)
             st.session_state["expense_page"] = "new"
@@ -1389,46 +1388,16 @@ def render_record_list_page(df: pd.DataFrame, title: str, source: str, grouped_o
                 if action_label == "作廢":
                     api.record_soft_delete(actor=actor, record_id=record_id)
                     rec["status"] = "void"
-                    upsert_local_expense_draft(owner_email, rec)
+                    upsert_local_expense_draft(actor.email, rec)
                     st.success(f"{record_id} 已作廢。")
                 else:
-                    remove_local_expense_draft(owner_email, record_id, mark_deleted=True)
+                    remove_local_expense_draft(actor.email, record_id, mark_deleted=True)
                     rec["status"] = "deleted"
-                    upsert_local_expense_draft(owner_email, rec)
+                    upsert_local_expense_draft(actor.email, rec)
                     st.success(f"{record_id} 已刪除。")
-                refresh_runtime_cache(actor)
                 st.rerun()
             except Exception as e:
                 st.error(f"{action_label}失敗：{e}")
-
-        confirm_key = f"expense_hard_delete_confirm::{key_prefix}::{record_id}"
-        if st.session_state.get(confirm_key):
-            action_cols[5].markdown("<span style='color:#b91c1c;font-weight:600;'>待確認</span>", unsafe_allow_html=True)
-        elif action_cols[5].button("移除", key=f"{key_prefix}_hard_delete_{record_id}", disabled=not can_hard_delete(actor), use_container_width=True):
-            st.session_state[confirm_key] = True
-            st.rerun()
-
-        if st.session_state.get(confirm_key):
-            st.warning(f"{record_id} 將永久移除；執行前會先備份到 deleted archive。")
-            hd1, hd2 = st.columns(2)
-            if hd1.button("確認移除", key=f"{key_prefix}_hard_delete_yes_{record_id}", type="primary", use_container_width=True):
-                try:
-                    archive_deleted_record(rec, system_type="expense", actor_email=actor.email)
-                    remove_local_expense_draft(owner_email, record_id, mark_deleted=False)
-                    ok, msg = _queue_and_try_sync_expense(actor, 'expense_hard_delete', {'record_id': record_id, 'user_email': owner_email, 'system_type': 'expense'})
-                    st.session_state.pop(confirm_key, None)
-                    refresh_runtime_cache(actor)
-                    if ok:
-                        st.success(f"{record_id} 已永久移除。")
-                    else:
-                        st.warning(f"{record_id} 已備份並標記待同步移除：{msg}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"永久移除失敗：{e}")
-            if hd2.button("取消移除", key=f"{key_prefix}_hard_delete_no_{record_id}", use_container_width=True):
-                st.session_state.pop(confirm_key, None)
-                st.info("已取消移除。")
-                st.rerun()
 
 
 def render_drafts_page(grouped_options: Dict[str, List[str]], defaults: Dict[str, Any]) -> None:

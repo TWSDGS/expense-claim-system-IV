@@ -193,6 +193,9 @@ class AppsScriptStorage:
     def record_hard_delete(self, actor: Actor, record_id: str) -> Dict[str, Any]:
         return self._post("record_hard_delete", actor=actor, payload={"record_id": record_id})
 
+    def record_restore(self, actor: Actor, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self._post("record_restore", actor=actor, payload=payload)
+
     def get_single_user_defaults(self, email: str) -> Dict[str, Any]:
         rows = self.user_defaults_list(email=email)
         return rows[0] if rows else {}

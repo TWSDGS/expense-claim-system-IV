@@ -15,6 +15,8 @@ const WEBAPP_API_CONFIG = {
         options: 'Options',
         logs: '操作紀錄',
         settings: '系統設定',
+        syncEvents: '同步事件',
+        deletedArchive: '刪除備援',
       },
       formType: 'expense',
     },
@@ -28,14 +30,27 @@ const WEBAPP_API_CONFIG = {
         options: 'Options',
         logs: '操作紀錄',
         settings: '系統設定',
+        syncEvents: '同步事件',
+        deletedArchive: '刪除備援',
       },
       formType: 'travel',
     },
   },
 };
 
+const RECORD_META_COLUMNS = [
+  ['version', '版本'],
+  ['last_event_id', '最後事件ID'],
+  ['last_synced_at', '最後同步時間'],
+  ['deleted_reason', '刪除原因'],
+];
+
+function withMetaColumns_(schema) {
+  return schema.concat(RECORD_META_COLUMNS);
+}
+
 const SHEET_SCHEMAS = {
-  expense_submitted: [
+  expense_submitted: withMetaColumns_([
     ['record_id', '表單編號'], ['status', '狀態'], ['form_type', '表單類型'], ['form_date', '填寫日期'],
     ['plan_code', '計畫代號'], ['purpose_desc', '用途說明'],
     ['employee_enabled', '員工姓名_是否勾選'], ['employee_name', '員工姓名'], ['employee_no', '工號'],
@@ -48,9 +63,9 @@ const SHEET_SCHEMAS = {
     ['owner_name', '擁有人'], ['user_email', '使用者Email'], ['actor_role', '角色'], ['source_system', '來源系統'],
     ['created_at', '建立時間'], ['created_by', '建立者'], ['updated_at', '更新時間'], ['updated_by', '更新者'], ['submitted_at', '送出時間'], ['submitted_by', '送出者'],
     ['is_deleted', '是否刪除'], ['deleted_at', '刪除時間'], ['deleted_by', '刪除者'],
-  ],
+  ]),
 
-  expense_draft: [
+  expense_draft: withMetaColumns_([
     ['record_id', '表單編號'], ['status', '狀態'], ['form_type', '表單類型'], ['form_date', '填寫日期'],
     ['plan_code', '計畫代號'], ['purpose_desc', '用途說明'],
     ['employee_enabled', '員工姓名_是否勾選'], ['employee_name', '員工姓名'], ['employee_no', '工號'],
@@ -63,10 +78,9 @@ const SHEET_SCHEMAS = {
     ['owner_name', '擁有人'], ['user_email', '使用者Email'], ['actor_role', '角色'], ['source_system', '來源系統'],
     ['created_at', '建立時間'], ['created_by', '建立者'], ['updated_at', '更新時間'], ['updated_by', '更新者'], ['submitted_at', '送出時間'], ['submitted_by', '送出者'],
     ['is_deleted', '是否刪除'], ['deleted_at', '刪除時間'], ['deleted_by', '刪除者'],
-  ],
+  ]),
 
-  // travel schema：保留既有表頭，但在 sanitizeRecordForWrite_ 內完整接受前端別名
-  travel_submitted: [
+  travel_submitted: withMetaColumns_([
     ['record_id', '表單編號'], ['status', '狀態'], ['form_type', '表單類型'], ['form_date', '填寫日期'],
     ['employee_name', '出差人'], ['employee_no', '員工編號'], ['department', '部門'], ['plan_code', '計畫代號'],
     ['trip_purpose', '出差事由'], ['from_location', '出發地'], ['to_location', '目的地'],
@@ -79,9 +93,9 @@ const SHEET_SCHEMAS = {
     ['owner_name', '擁有人'], ['user_email', '使用者Email'], ['actor_role', '角色'], ['source_system', '來源系統'],
     ['created_at', '建立時間'], ['created_by', '建立者'], ['updated_at', '更新時間'], ['updated_by', '更新者'], ['submitted_at', '送出時間'], ['submitted_by', '送出者'],
     ['is_deleted', '是否刪除'], ['deleted_at', '刪除時間'], ['deleted_by', '刪除者'],
-  ],
+  ]),
 
-  travel_draft: [
+  travel_draft: withMetaColumns_([
     ['record_id', '表單編號'], ['status', '狀態'], ['form_type', '表單類型'], ['form_date', '填寫日期'],
     ['employee_name', '出差人'], ['employee_no', '員工編號'], ['department', '部門'], ['plan_code', '計畫代號'],
     ['trip_purpose', '出差事由'], ['from_location', '出發地'], ['to_location', '目的地'],
@@ -94,7 +108,7 @@ const SHEET_SCHEMAS = {
     ['owner_name', '擁有人'], ['user_email', '使用者Email'], ['actor_role', '角色'], ['source_system', '來源系統'],
     ['created_at', '建立時間'], ['created_by', '建立者'], ['updated_at', '更新時間'], ['updated_by', '更新者'], ['submitted_at', '送出時間'], ['submitted_by', '送出者'],
     ['is_deleted', '是否刪除'], ['deleted_at', '刪除時間'], ['deleted_by', '刪除者'],
-  ],
+  ]),
 
   users: [
     ['name', '姓名'], ['email', 'Email'], ['role', '角色'], ['employee_no', '員工編號'], ['department', '部門'],
@@ -119,6 +133,17 @@ const SHEET_SCHEMAS = {
   settings: [
     ['setting_key', '設定鍵'], ['setting_value', '設定值'], ['remark', '備註'],
   ],
+
+  sync_events: [
+    ['event_id', '事件ID'], ['record_id', '表單編號'], ['system', '系統'], ['action', '動作'], ['request_hash', '請求雜湊'],
+    ['expected_version', '預期版本'], ['applied_version', '套用後版本'], ['status', '狀態'], ['actor_email', '執行者Email'],
+    ['created_at', '建立時間'], ['response_json', '回應JSON'], ['message', '訊息'],
+  ],
+
+  deleted_archive: [
+    ['archive_id', '備援編號'], ['record_id', '表單編號'], ['system', '系統'], ['from_sheet', '原分頁'], ['deleted_at', '刪除時間'],
+    ['deleted_by', '刪除者'], ['delete_action', '刪除動作'], ['record_json', '資料JSON'], ['version', '版本'], ['last_event_id', '最後事件ID'],
+  ],
 };
 
 function setupAllSystems() { setupSystem_('expense'); setupSystem_('travel'); }
@@ -140,7 +165,20 @@ function setupSystem_(systemKey) {
   ensureSheetSchema_(ss, system.sheets.options, SHEET_SCHEMAS.options);
   ensureSheetSchema_(ss, system.sheets.logs, SHEET_SCHEMAS.logs);
   ensureSheetSchema_(ss, system.sheets.settings, SHEET_SCHEMAS.settings);
+  ensureSheetSchema_(ss, system.sheets.syncEvents, SHEET_SCHEMAS.sync_events);
+  ensureSheetSchema_(ss, system.sheets.deletedArchive, SHEET_SCHEMAS.deleted_archive);
   seedDefaultData_(ss, systemKey);
+}
+
+function ensureSystemInfra_(system) {
+  const ss = SpreadsheetApp.openById(system.spreadsheetId);
+  const formSchemaSubmitted = system.formType === 'expense' ? SHEET_SCHEMAS.expense_submitted : SHEET_SCHEMAS.travel_submitted;
+  const formSchemaDraft = system.formType === 'expense' ? SHEET_SCHEMAS.expense_draft : SHEET_SCHEMAS.travel_draft;
+  ensureSheetSchema_(ss, system.sheets.submitted, formSchemaSubmitted);
+  ensureSheetSchema_(ss, system.sheets.draft, formSchemaDraft);
+  ensureSheetSchema_(ss, system.sheets.logs, SHEET_SCHEMAS.logs);
+  ensureSheetSchema_(ss, system.sheets.syncEvents, SHEET_SCHEMAS.sync_events);
+  ensureSheetSchema_(ss, system.sheets.deletedArchive, SHEET_SCHEMAS.deleted_archive);
 }
 
 function ensureSheetSchema_(ss, sheetName, schema) {
@@ -148,10 +186,11 @@ function ensureSheetSchema_(ss, sheetName, schema) {
   if (!sheet) sheet = ss.insertSheet(sheetName);
   const keys = schema.map(r => r[0]);
   const labels = schema.map(r => r[1]);
+  const currentCols = sheet.getMaxColumns();
+  if (currentCols < keys.length) sheet.insertColumnsAfter(currentCols, keys.length - currentCols);
   sheet.getRange(1, 1, 1, keys.length).setValues([keys]);
   sheet.getRange(2, 1, 1, labels.length).setValues([labels]);
   if (sheet.getFrozenRows() < 2) sheet.setFrozenRows(2);
-  if (sheet.getMaxColumns() < keys.length) sheet.insertColumnsAfter(sheet.getMaxColumns(), keys.length - sheet.getMaxColumns());
 }
 
 function seedDefaultData_(ss, systemKey) {
@@ -197,7 +236,7 @@ function seedOptions_(sheet, systemKey) {
 
 function seedSettings_(sheet, systemKey) {
   if (sheet.getLastRow() >= 3) return;
-  const rows = [['system_name', systemKey === 'expense' ? '支出憑證黏存單系統' : '國內出差申請單系統', '系統名稱'], ['version', 'v2026.03.travel-mapping-aligned', '版本']];
+  const rows = [['system_name', systemKey === 'expense' ? '支出憑證黏存單系統' : '國內出差申請單系統', '系統名稱'], ['version', 'v2026.03.version-idempotent', '版本']];
   sheet.getRange(3, 1, rows.length, rows[0].length).setValues(rows);
 }
 
@@ -212,11 +251,11 @@ function doGet(e) {
       case 'user_defaults_list': result = handleUserDefaultsList_(params); break;
       case 'options_list': result = handleOptionsList_(params); break;
       case 'record_list_all': result = handleRecordListAll_(params); break;
-      default: result = err_('unknown action: ' + action);
+      default: result = err_('unknown action: ' + action, 'UNKNOWN_ACTION');
     }
     return jsonOutput_(result);
   } catch (error) {
-    return jsonOutput_(err_(stringifyError_(error)));
+    return jsonOutput_(err_(stringifyError_(error), 'SERVER_ERROR'));
   }
 }
 
@@ -230,16 +269,18 @@ function doPost(e) {
       case 'record_submit': result = handleRecordSubmit_(body); break;
       case 'record_soft_delete': result = handleRecordSoftDelete_(body); break;
       case 'record_hard_delete': result = handleRecordHardDelete_(body); break;
-      default: result = err_('unknown action: ' + action);
+      case 'record_restore': result = handleRecordRestore_(body); break;
+      default: result = err_('unknown action: ' + action, 'UNKNOWN_ACTION');
     }
     return jsonOutput_(result);
   } catch (error) {
-    return jsonOutput_(err_(stringifyError_(error)));
+    return jsonOutput_(err_(stringifyError_(error), 'SERVER_ERROR'));
   }
 }
 
 function handleUsersList_(params) {
   const system = requireSystem_(params.system);
+  ensureSystemInfra_(system);
   const rows = readSheetObjects_(system, system.sheets.users)
     .filter(r => truthy_(r.is_active) || r.is_active === '' || r.is_active === undefined)
     .sort((a, b) => num_(a.sort_order) - num_(b.sort_order));
@@ -248,6 +289,7 @@ function handleUsersList_(params) {
 
 function handleUserDefaultsList_(params) {
   const system = requireSystem_(params.system);
+  ensureSystemInfra_(system);
   let rows = readSheetObjects_(system, system.sheets.userDefaults)
     .filter(r => truthy_(r.is_active) || r.is_active === '' || r.is_active === undefined);
   const email = normalizeEmail_(params.email || '');
@@ -257,6 +299,7 @@ function handleUserDefaultsList_(params) {
 
 function handleOptionsList_(params) {
   const system = requireSystem_(params.system);
+  ensureSystemInfra_(system);
   let rows = readSheetObjects_(system, system.sheets.options)
     .filter(r => truthy_(r.is_active) || r.is_active === '' || r.is_active === undefined)
     .sort((a, b) => num_(a.sort_order) - num_(b.sort_order));
@@ -267,83 +310,175 @@ function handleOptionsList_(params) {
 
 function handleRecordListAll_(params) {
   const system = requireSystem_(params.system);
+  ensureSystemInfra_(system);
   const actor = buildActorFromParams_(params);
   let submittedRows = readSheetObjects_(system, system.sheets.submitted).map(r => { r._sheet_name = system.sheets.submitted; return r; });
   let draftRows = readSheetObjects_(system, system.sheets.draft).map(r => { r._sheet_name = system.sheets.draft; return r; });
-  let allRows = submittedRows.concat(draftRows).filter(r => !truthy_(r.is_deleted));
+  let allRows = dedupeRowsByRecordId_(submittedRows.concat(draftRows));
   const status = ((params.status || '') + '').trim();
-  if (status) allRows = allRows.filter(r => (r.status || '') === status);
+  if (status) allRows = allRows.filter(r => String(r.status || '') === status);
   const ownerOnly = ((params.owner_only || '') + '').trim().toLowerCase() === 'true';
   if (ownerOnly && actor.email) allRows = allRows.filter(r => normalizeEmail_(r.user_email) === normalizeEmail_(actor.email));
-  allRows.sort((a, b) => (b.updated_at || b.created_at || '').localeCompare(a.updated_at || a.created_at || ''));
+  allRows.sort((a, b) => compareRowsDesc_(a, b));
   return ok_('records loaded', { rows: allRows, count: allRows.length });
 }
 
 function handleRecordSaveDraft_(body) {
-  const system = requireSystem_(body.system);
-  const actor = normalizeActor_(body.actor || {});
-  const payload = body.payload || {};
-  const record = sanitizeRecordForWrite_(system, payload, actor, 'draft');
-  const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-    if (!record.record_id) record.record_id = generateRecordId_(system, record, actor);
-    const existing = findRecordAnywhere_(system, record.record_id);
-    if (existing) {
-      record.created_at = existing.record.created_at || record.created_at;
-      record.created_by = existing.record.created_by || record.created_by;
-      upsertRecordToSheet_(system, system.sheets.draft, record, true);
-      if (existing.sheetName !== system.sheets.draft) deleteRecordByIdFromSheet_(system, existing.sheetName, record.record_id);
-    } else {
-      upsertRecordToSheet_(system, system.sheets.draft, record, true);
-    }
-    return ok_('draft saved', { record_id: record.record_id, status: 'draft' });
-  } finally { lock.releaseLock(); }
+  return processRecordWrite_(body, 'draft');
 }
 
 function handleRecordSubmit_(body) {
-  const system = requireSystem_(body.system);
-  const actor = normalizeActor_(body.actor || {});
-  const payload = body.payload || {};
-  const record = sanitizeRecordForWrite_(system, payload, actor, 'submitted');
-  const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-    if (!record.record_id) record.record_id = generateRecordId_(system, record, actor);
-    const existing = findRecordAnywhere_(system, record.record_id);
-    if (existing) {
-      record.created_at = existing.record.created_at || record.created_at;
-      record.created_by = existing.record.created_by || record.created_by;
-      upsertRecordToSheet_(system, system.sheets.submitted, record, true);
-      if (existing.sheetName !== system.sheets.submitted) deleteRecordByIdFromSheet_(system, existing.sheetName, record.record_id);
-    } else {
-      upsertRecordToSheet_(system, system.sheets.submitted, record, true);
-    }
-    return ok_('record submitted', { record_id: record.record_id, status: 'submitted' });
-  } finally { lock.releaseLock(); }
+  return processRecordWrite_(body, 'submitted');
 }
 
 function handleRecordSoftDelete_(body) {
   const system = requireSystem_(body.system);
+  ensureSystemInfra_(system);
   const actor = normalizeActor_(body.actor || {});
-  const recordId = ((body.payload || {}).record_id || '').trim();
-  if (!recordId) return err_('record_id is required');
-  const existing = findRecordAnywhere_(system, recordId);
-  if (!existing) return err_('record not found');
-  const record = Object.assign({}, existing.record, { status: 'deleted', is_deleted: true, deleted_at: nowIso_(), deleted_by: actor.email || '', updated_at: nowIso_(), updated_by: actor.email || '' });
-  upsertRecordToSheet_(system, system.sheets.draft, record, true);
-  if (existing.sheetName !== system.sheets.draft) deleteRecordByIdFromSheet_(system, existing.sheetName, recordId);
-  return ok_('record soft deleted', { record_id: recordId });
+  const payload = body.payload || {};
+  const recordId = ((payload.record_id || '') + '').trim();
+  if (!recordId) return err_('record_id is required', 'VALIDATION_ERROR');
+  const meta = buildMutationMeta_(payload, body, actor, 'soft_delete');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const replay = getReplayIfHandled_(system, meta.eventId);
+    if (replay) return replay;
+    const existing = findRecordAnywhere_(system, recordId);
+    if (!existing) return err_('record not found', 'NOT_FOUND');
+    const conflict = checkVersionConflict_(existing.record, meta);
+    if (conflict) return conflict;
+    const targetStatus = String(payload.status || '').trim().toLowerCase() || (String(existing.record.status || '').trim().toLowerCase() === 'submitted' ? 'void' : 'deleted');
+    const now = nowIso_();
+    const record = Object.assign({}, existing.record, {
+      status: targetStatus,
+      is_deleted: targetStatus === 'deleted',
+      deleted_at: now,
+      deleted_by: actor.email || '',
+      deleted_reason: String(payload.deleted_reason || payload.reason || ''),
+      updated_at: now,
+      updated_by: actor.email || '',
+      version: currentVersion_(existing.record) + 1,
+      last_event_id: meta.eventId,
+      last_synced_at: now,
+    });
+    archiveRecord_(system, existing.sheetName, record, actor, 'soft_delete');
+    upsertRecordToSheet_(system, system.sheets.draft, record, true);
+    if (existing.sheetName !== system.sheets.draft) deleteRecordByIdFromSheet_(system, existing.sheetName, recordId);
+    appendLog_(system, recordId, 'soft_delete', actor, existing.record.status || '', targetStatus, 'success', 'soft delete applied');
+    const response = ok_('record soft deleted', { record_id: recordId, status: targetStatus, version: record.version, event_id: meta.eventId, idempotent: false });
+    appendSyncEvent_(system, meta, recordId, targetStatus, record.version, 'applied', response, 'soft delete applied');
+    return response;
+  } finally { lock.releaseLock(); }
 }
 
 function handleRecordHardDelete_(body) {
   const system = requireSystem_(body.system);
-  const recordId = ((body.payload || {}).record_id || '').trim();
-  if (!recordId) return err_('record_id is required');
-  const existing = findRecordAnywhere_(system, recordId);
-  if (!existing) return err_('record not found');
-  deleteRecordByIdFromSheet_(system, existing.sheetName, recordId);
-  return ok_('record hard deleted', { record_id: recordId });
+  ensureSystemInfra_(system);
+  const actor = normalizeActor_(body.actor || {});
+  const payload = body.payload || {};
+  const recordId = ((payload.record_id || '') + '').trim();
+  if (!recordId) return err_('record_id is required', 'VALIDATION_ERROR');
+  const meta = buildMutationMeta_(payload, body, actor, 'hard_delete');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const replay = getReplayIfHandled_(system, meta.eventId);
+    if (replay) return replay;
+    const existing = findRecordAnywhere_(system, recordId);
+    if (!existing) return err_('record not found', 'NOT_FOUND');
+    const conflict = checkVersionConflict_(existing.record, meta);
+    if (conflict) return conflict;
+    archiveRecord_(system, existing.sheetName, existing.record, actor, 'hard_delete');
+    deleteRecordByIdFromSheet_(system, existing.sheetName, recordId);
+    appendLog_(system, recordId, 'hard_delete', actor, existing.record.status || '', '', 'success', 'hard delete applied');
+    const response = ok_('record hard deleted', { record_id: recordId, event_id: meta.eventId, idempotent: false, deleted_version: currentVersion_(existing.record) });
+    appendSyncEvent_(system, meta, recordId, '', currentVersion_(existing.record), 'applied', response, 'hard delete applied');
+    return response;
+  } finally { lock.releaseLock(); }
+}
+
+function handleRecordRestore_(body) {
+  const system = requireSystem_(body.system);
+  ensureSystemInfra_(system);
+  const actor = normalizeActor_(body.actor || {});
+  const payload = body.payload || {};
+  const recordId = ((payload.record_id || '') + '').trim();
+  if (!recordId) return err_('record_id is required', 'VALIDATION_ERROR');
+  const meta = buildMutationMeta_(payload, body, actor, 'restore');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const replay = getReplayIfHandled_(system, meta.eventId);
+    if (replay) return replay;
+    const existing = findRecordAnywhere_(system, recordId);
+    if (!existing) return err_('record not found', 'NOT_FOUND');
+    const conflict = checkVersionConflict_(existing.record, meta);
+    if (conflict) return conflict;
+    const beforeStatus = String(existing.record.status || '').trim().toLowerCase();
+    const restoredStatus = beforeStatus === 'void' ? 'submitted' : 'draft';
+    const now = nowIso_();
+    const record = Object.assign({}, existing.record, {
+      status: restoredStatus,
+      is_deleted: false,
+      deleted_at: '',
+      deleted_by: '',
+      deleted_reason: '',
+      updated_at: now,
+      updated_by: actor.email || '',
+      version: currentVersion_(existing.record) + 1,
+      last_event_id: meta.eventId,
+      last_synced_at: now,
+    });
+    const targetSheet = restoredStatus === 'submitted' ? system.sheets.submitted : system.sheets.draft;
+    upsertRecordToSheet_(system, targetSheet, record, true);
+    if (existing.sheetName !== targetSheet) deleteRecordByIdFromSheet_(system, existing.sheetName, recordId);
+    appendLog_(system, recordId, 'restore', actor, beforeStatus, restoredStatus, 'success', 'restore applied');
+    const response = ok_('record restored', { record_id: recordId, status: restoredStatus, version: record.version, event_id: meta.eventId, idempotent: false });
+    appendSyncEvent_(system, meta, recordId, restoredStatus, record.version, 'applied', response, 'restore applied');
+    return response;
+  } finally { lock.releaseLock(); }
+}
+
+function processRecordWrite_(body, finalStatus) {
+  const system = requireSystem_(body.system);
+  ensureSystemInfra_(system);
+  const actor = normalizeActor_(body.actor || {});
+  const payload = body.payload || {};
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const meta = buildMutationMeta_(payload, body, actor, finalStatus === 'submitted' ? 'submit' : 'save_draft');
+    const replay = getReplayIfHandled_(system, meta.eventId);
+    if (replay) return replay;
+    const recordId = String(payload.record_id || '').trim();
+    const existing = recordId ? findRecordAnywhere_(system, recordId) : null;
+    const conflict = checkVersionConflict_(existing ? existing.record : null, meta);
+    if (conflict) return conflict;
+    const record = sanitizeRecordForWrite_(system, payload, actor, finalStatus, existing ? existing.record : null, meta);
+    if (!record.record_id) record.record_id = generateRecordId_(system, record, actor);
+    const targetSheet = finalStatus === 'submitted' ? system.sheets.submitted : system.sheets.draft;
+    if (existing) {
+      record.created_at = existing.record.created_at || record.created_at;
+      record.created_by = existing.record.created_by || record.created_by;
+      upsertRecordToSheet_(system, targetSheet, record, true);
+      if (existing.sheetName !== targetSheet) deleteRecordByIdFromSheet_(system, existing.sheetName, record.record_id);
+      appendLog_(system, record.record_id, finalStatus === 'submitted' ? 'submit' : 'save_draft', actor, existing.record.status || '', finalStatus, 'success', 'record upserted');
+    } else {
+      upsertRecordToSheet_(system, targetSheet, record, true);
+      appendLog_(system, record.record_id, finalStatus === 'submitted' ? 'submit' : 'save_draft', actor, '', finalStatus, 'success', 'record inserted');
+    }
+    const response = ok_(finalStatus === 'submitted' ? 'record submitted' : 'draft saved', {
+      record_id: record.record_id,
+      status: finalStatus,
+      version: record.version,
+      updated_at: record.updated_at,
+      event_id: meta.eventId,
+      idempotent: false,
+    });
+    appendSyncEvent_(system, meta, record.record_id, finalStatus, record.version, 'applied', response, 'write applied');
+    return response;
+  } finally { lock.releaseLock(); }
 }
 
 function readSheetObjects_(system, sheetName) {
@@ -404,7 +539,7 @@ function findRecordAnywhere_(system, recordId) {
   return null;
 }
 
-function sanitizeRecordForWrite_(system, payload, actor, finalStatus) {
+function sanitizeRecordForWrite_(system, payload, actor, finalStatus, existingRecord, mutationMeta) {
   const now = nowIso_();
   const clean = Object.assign({}, payload || {});
 
@@ -414,32 +549,38 @@ function sanitizeRecordForWrite_(system, payload, actor, finalStatus) {
   clean.owner_name = clean.owner_name || actor.name || '';
   clean.user_email = normalizeEmail_(clean.user_email || actor.email || '');
   clean.actor_role = actor.role || 'user';
-  if (!clean.created_at) clean.created_at = now;
-  if (!clean.created_by) clean.created_by = actor.email || '';
+  if (!clean.created_at) clean.created_at = (existingRecord && existingRecord.created_at) || now;
+  if (!clean.created_by) clean.created_by = (existingRecord && existingRecord.created_by) || actor.email || '';
   clean.updated_at = now;
   clean.updated_by = actor.email || '';
+  clean.version = currentVersion_(existingRecord) + 1;
+  clean.last_event_id = mutationMeta.eventId;
+  clean.last_synced_at = now;
   if (finalStatus === 'submitted') {
     clean.submitted_at = now;
     clean.submitted_by = actor.email || '';
     clean.is_deleted = false;
   }
-  if (finalStatus === 'draft') clean.is_deleted = false;
+  if (finalStatus === 'draft') {
+    clean.is_deleted = false;
+    if (!clean.submitted_at && existingRecord) clean.submitted_at = existingRecord.submitted_at || '';
+    if (!clean.submitted_by && existingRecord) clean.submitted_by = existingRecord.submitted_by || '';
+  }
   if (!clean.source_system) clean.source_system = system.formType;
 
   if (system.formType === 'expense') {
-    clean.department = '化安處';
+    clean.department = clean.department || '化安處';
     clean.amount_untaxed = Math.round(Number(clean.amount_untaxed || 0));
     clean.tax_amount = Math.round(Number(clean.tax_amount || 0));
     clean.amount_total = Math.round(Number(clean.amount_total || 0));
     clean.receipt_count = Math.round(Number(clean.receipt_count || 0));
-    clean.handler_name = '';
-    clean.project_manager_name = '';
-    clean.department_manager_name = '';
-    clean.accountant_name = '';
+    clean.handler_name = clean.handler_name || '';
+    clean.project_manager_name = clean.project_manager_name || '';
+    clean.department_manager_name = clean.department_manager_name || '';
+    clean.accountant_name = clean.accountant_name || '';
     return clean;
   }
 
-  // ===== travel alias mapping：前端欄位 -> 雲端 schema =====
   clean.employee_name = clean.employee_name || clean.traveler || clean.handler_name || '';
   clean.employee_no = clean.employee_no || actor.employee_no || '';
   clean.department = clean.department || actor.department || '';
@@ -480,6 +621,193 @@ function sanitizeRecordForWrite_(system, payload, actor, finalStatus) {
   clean.trip_days = calcTripDays_(clean.trip_date_start, clean.trip_date_end);
 
   return clean;
+}
+
+function buildMutationMeta_(payload, body, actor, action) {
+  const eventId = String((payload && payload.event_id) || body.event_id || '').trim() || generateEventId_();
+  const expectedVersionRaw = (payload && (payload.expected_version !== undefined ? payload.expected_version : payload.base_version));
+  const expectedVersion = expectedVersionRaw === '' || expectedVersionRaw === null || expectedVersionRaw === undefined ? null : Number(expectedVersionRaw);
+  return {
+    eventId: eventId,
+    action: action,
+    expectedVersion: isNaN(expectedVersion) ? null : expectedVersion,
+    requestHash: makeRequestHash_(payload || {}),
+    actorEmail: normalizeEmail_(actor.email || ''),
+  };
+}
+
+function getReplayIfHandled_(system, eventId) {
+  if (!eventId) return null;
+  const existing = findSyncEvent_(system, eventId);
+  if (!existing || String(existing.status || '') !== 'applied') return null;
+  let parsed = {};
+  try { parsed = JSON.parse(String(existing.response_json || '{}')); } catch (e) { parsed = {}; }
+  if (parsed && typeof parsed === 'object') {
+    parsed.ok = parsed.ok !== false;
+    parsed.message = parsed.message || 'idempotent replay';
+    parsed.data = Object.assign({}, parsed.data || {}, { idempotent: true, event_id: eventId, replayed: true });
+    return parsed;
+  }
+  return ok_('idempotent replay', { idempotent: true, event_id: eventId, replayed: true });
+}
+
+function findSyncEvent_(system, eventId) {
+  if (!eventId) return null;
+  const rows = readSheetObjects_(system, system.sheets.syncEvents);
+  return rows.find(r => String(r.event_id || '').trim() === String(eventId).trim()) || null;
+}
+
+function appendSyncEvent_(system, meta, recordId, status, appliedVersion, responseObj, responseDataOrMessage, maybeMessage) {
+  const sheet = getSheet_(system, system.sheets.syncEvents);
+  const headers = getHeaderKeys_(sheet);
+  const existing = findSyncEvent_(system, meta.eventId);
+  const response = maybeMessage === undefined ? responseObj : responseDataOrMessage;
+  const message = maybeMessage === undefined ? responseDataOrMessage : maybeMessage;
+  const row = {
+    event_id: meta.eventId,
+    record_id: recordId || '',
+    system: system.formType,
+    action: meta.action,
+    request_hash: meta.requestHash,
+    expected_version: meta.expectedVersion === null ? '' : meta.expectedVersion,
+    applied_version: appliedVersion === undefined || appliedVersion === null ? '' : appliedVersion,
+    status: status,
+    actor_email: meta.actorEmail,
+    created_at: nowIso_(),
+    response_json: JSON.stringify(response || {}),
+    message: String(message || ''),
+  };
+  if (existing) {
+    upsertGenericObjectByKey_(sheet, headers, 'event_id', row, true);
+  } else {
+    upsertGenericObjectByKey_(sheet, headers, 'event_id', row, true);
+  }
+}
+
+function archiveRecord_(system, fromSheet, record, actor, deleteAction) {
+  const sheet = getSheet_(system, system.sheets.deletedArchive);
+  const headers = getHeaderKeys_(sheet);
+  const archiveId = 'ARC-' + Utilities.getUuid();
+  const row = {
+    archive_id: archiveId,
+    record_id: record.record_id || '',
+    system: system.formType,
+    from_sheet: fromSheet || '',
+    deleted_at: nowIso_(),
+    deleted_by: actor.email || '',
+    delete_action: deleteAction || '',
+    record_json: JSON.stringify(record || {}),
+    version: currentVersion_(record),
+    last_event_id: record.last_event_id || '',
+  };
+  upsertGenericObjectByKey_(sheet, headers, 'archive_id', row, true);
+  return archiveId;
+}
+
+function appendLog_(system, recordId, action, actor, beforeStatus, afterStatus, result, message) {
+  const sheet = getSheet_(system, system.sheets.logs);
+  const headers = getHeaderKeys_(sheet);
+  const row = {
+    log_id: 'LOG-' + Utilities.getUuid(),
+    record_id: recordId || '',
+    action: action || '',
+    actor_name: actor.name || '',
+    actor_email: actor.email || '',
+    actor_role: actor.role || '',
+    target_status_before: beforeStatus || '',
+    target_status_after: afterStatus || '',
+    action_time: nowIso_(),
+    action_result: result || '',
+    message: message || '',
+  };
+  upsertGenericObjectByKey_(sheet, headers, 'log_id', row, true);
+}
+
+function checkVersionConflict_(existingRecord, meta) {
+  if (!existingRecord || meta.expectedVersion === null) return null;
+  const currentVersion = currentVersion_(existingRecord);
+  if (currentVersion !== meta.expectedVersion) {
+    return err_('version conflict', 'VERSION_CONFLICT', {
+      record_id: existingRecord.record_id || '',
+      current_version: currentVersion,
+      expected_version: meta.expectedVersion,
+      updated_at: existingRecord.updated_at || '',
+      updated_by: existingRecord.updated_by || '',
+      event_id: meta.eventId,
+    });
+  }
+  return null;
+}
+
+function currentVersion_(record) {
+  const n = Number((record || {}).version || 0);
+  return isNaN(n) ? 0 : n;
+}
+
+function dedupeRowsByRecordId_(rows) {
+  const map = {};
+  const extras = [];
+  (rows || []).forEach(r => {
+    const rid = String((r || {}).record_id || '').trim();
+    if (!rid) {
+      extras.push(r);
+      return;
+    }
+    if (!map[rid]) {
+      map[rid] = r;
+      return;
+    }
+    map[rid] = chooseNewerRow_(map[rid], r);
+  });
+  return Object.keys(map).map(k => map[k]).concat(extras);
+}
+
+function chooseNewerRow_(a, b) {
+  const va = currentVersion_(a), vb = currentVersion_(b);
+  if (va !== vb) return vb > va ? b : a;
+  return compareRowsDesc_(a, b) <= 0 ? a : b;
+}
+
+function compareRowsDesc_(a, b) {
+  const sa = String((a && (a.updated_at || a.created_at)) || '');
+  const sb = String((b && (b.updated_at || b.created_at)) || '');
+  return sb.localeCompare(sa);
+}
+
+function upsertGenericObjectByKey_(sheet, headers, keyName, obj, allowInsert) {
+  const lastRow = sheet.getLastRow();
+  const keyCol = findHeaderIndex_(headers, keyName);
+  if (keyCol < 0) throw new Error('key column not found: ' + keyName);
+  let targetRow = null;
+  if (lastRow >= WEBAPP_API_CONFIG.DATA_START_ROW) {
+    const values = sheet.getRange(WEBAPP_API_CONFIG.DATA_START_ROW, keyCol + 1, lastRow - WEBAPP_API_CONFIG.DATA_START_ROW + 1, 1).getValues().flat();
+    for (let i = 0; i < values.length; i++) {
+      if (String(values[i] || '').trim() === String(obj[keyName] || '').trim()) {
+        targetRow = WEBAPP_API_CONFIG.DATA_START_ROW + i;
+        break;
+      }
+    }
+  }
+  const rowValues = headers.map(h => obj[h] !== undefined ? obj[h] : '');
+  if (targetRow) {
+    sheet.getRange(targetRow, 1, 1, headers.length).setValues([rowValues]);
+    return targetRow;
+  }
+  if (!allowInsert) throw new Error('row not found and insert not allowed');
+  const insertRow = Math.max(sheet.getLastRow() + 1, WEBAPP_API_CONFIG.DATA_START_ROW);
+  ensureSheetRows_(sheet, insertRow);
+  sheet.getRange(insertRow, 1, 1, headers.length).setValues([rowValues]);
+  return insertRow;
+}
+
+function makeRequestHash_(payload) {
+  const text = JSON.stringify(payload || {});
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text, Utilities.Charset.UTF_8);
+  return bytes.map(function(b) { const s = (b < 0 ? b + 256 : b).toString(16); return ('0' + s).slice(-2); }).join('');
+}
+
+function generateEventId_() {
+  return 'EVT-' + Utilities.getUuid();
 }
 
 function normalizeDateText_(v) {
@@ -543,7 +871,7 @@ function calcTripDays_(startDate, endDate) {
 }
 
 function numberToChineseMoney_(num) { if (num === '' || num === null || num === undefined) return ''; return String(num); }
-function getSheet_(system, sheetName) { const ss = SpreadsheetApp.openById(system.spreadsheetId); const sheet = ss.getSheetByName(sheetName); if (!sheet) throw new Error('sheet not found: ' + sheetName); return sheet; }
+function getSheet_(system, sheetName) { const ss = SpreadsheetApp.openById(system.spreadsheetId); let sheet = ss.getSheetByName(sheetName); if (!sheet) sheet = ss.insertSheet(sheetName); return sheet; }
 function getHeaderKeys_(sheet) { const lastCol = sheet.getLastColumn(); return sheet.getRange(WEBAPP_API_CONFIG.HEADER_KEY_ROW, 1, 1, lastCol).getValues()[0]; }
 function findHeaderIndex_(headers, key) { return headers.indexOf(key); }
 function rowToObject_(headers, row, rowNumber) { const obj = {}; headers.forEach((h, i) => { obj[h] = row[i]; }); obj._row_number = rowNumber; return obj; }
@@ -573,6 +901,6 @@ function truthy_(v) { if (v === true) return true; const s = String(v || '').tri
 function num_(v) { const n = Number(v); return isNaN(n) ? 999999 : n; }
 function nowIso_() { return Utilities.formatDate(new Date(), WEBAPP_API_CONFIG.TIMEZONE, "yyyy-MM-dd'T'HH:mm:ss"); }
 function ok_(message, data) { return { ok: true, message: message, data: data || {} }; }
-function err_(message) { return { ok: false, message: message }; }
+function err_(message, code, data) { return { ok: false, message: message, code: code || 'ERROR', data: data || {} }; }
 function jsonOutput_(obj) { return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON); }
 function stringifyError_(error) { return error.stack || error.message || String(error || 'unknown error'); }

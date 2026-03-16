@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,6 +18,9 @@ ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
 PENDING_QUEUE_FILE = CACHE_DIR / "pending_sync_queue.json"
 SIGNATURES_DIR = CACHE_DIR / "signatures"
 SIGNATURES_DIR.mkdir(parents=True, exist_ok=True)
+DELETED_ARCHIVE_JSON = CACHE_DIR / "deleted_archive.json"
+DELETED_ARCHIVE_XLSX = CACHE_DIR / "deleted_archive.xlsx"
+AUDIT_LOG_JSON = CACHE_DIR / "sync_audit_log.json"
 
 
 def _cache_path(filename: str) -> Path:
@@ -44,6 +48,32 @@ def _pending_queue_path(email: Optional[str] = None) -> Path:
         return PENDING_QUEUE_FILE
     return CACHE_DIR / f"pending_sync_queue__{scope}.json"
 
+
+
+
+def _snapshot_filename(system_type: str, owner_email: Optional[str] = None) -> str:
+    return f"master_snapshot__{str(system_type or '').strip().lower()}__{_queue_scope_key(owner_email)}.json"
+
+
+def save_master_snapshot(system_type: str, owner_email: Optional[str], rows: List[Dict[str, Any]]) -> None:
+    save_json_cache(_snapshot_filename(system_type, owner_email), rows or [])
+
+
+def load_master_snapshot(system_type: str, owner_email: Optional[str]) -> List[Dict[str, Any]]:
+    rows = load_json_cache(_snapshot_filename(system_type, owner_email), default=[])
+    return rows if isinstance(rows, list) else []
+
+
+def append_sync_audit(event: Dict[str, Any]) -> None:
+    rows = load_json_cache(AUDIT_LOG_JSON.name, default=[])
+    if not isinstance(rows, list):
+        rows = []
+    entry = dict(event or {})
+    entry.setdefault('logged_at', datetime.now().isoformat(timespec='seconds'))
+    rows.append(entry)
+    if len(rows) > 5000:
+        rows = rows[-5000:]
+    save_json_cache(AUDIT_LOG_JSON.name, rows)
 
 def save_json_cache(filename: str, data: Any) -> None:
     path = _cache_path(filename)
@@ -95,6 +125,94 @@ def save_cloud_backup_excel(
             safe_df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
     return path
 
+
+
+
+def _archive_identity(row: Dict[str, Any]) -> str:
+    record_id = str((row or {}).get("record_id", "")).strip()
+    archived_at = str((row or {}).get("archived_at", "")).strip()
+    system_type = str((row or {}).get("archive_system_type", "")).strip().lower()
+    return f"{system_type}::{record_id}::{archived_at}"
+
+
+def archive_deleted_record(record: Dict[str, Any], system_type: str = "unknown", actor_email: str = "") -> None:
+    row = dict(record or {})
+    row["archive_system_type"] = str(system_type or "unknown")
+    row["archive_actor_email"] = str(actor_email or "").strip().lower()
+    row["archived_at"] = datetime.now().isoformat(timespec="seconds")
+    row.setdefault("archive_restored", False)
+    row.setdefault("restored_at", "")
+    row.setdefault("restored_by", "")
+    row.setdefault("restore_target_status", "")
+    row["archive_id"] = _archive_identity(row)
+    rows = load_json_cache(DELETED_ARCHIVE_JSON.name, default=[])
+    if not isinstance(rows, list):
+        rows = []
+    rows.append(row)
+    save_json_cache(DELETED_ARCHIVE_JSON.name, rows)
+    try:
+        df = pd.DataFrame(rows)
+        with pd.ExcelWriter(DELETED_ARCHIVE_XLSX, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="deleted_archive", index=False)
+    except Exception:
+        pass
+
+
+def load_deleted_archive_rows(system_type: Optional[str] = None, include_restored: bool = False) -> List[Dict[str, Any]]:
+    rows = load_json_cache(DELETED_ARCHIVE_JSON.name, default=[])
+    if not isinstance(rows, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        r = dict(row)
+        r.setdefault("archive_id", _archive_identity(r))
+        r.setdefault("archive_restored", False)
+        r.setdefault("restored_at", "")
+        r.setdefault("restored_by", "")
+        r.setdefault("restore_target_status", "")
+        if system_type and str(r.get("archive_system_type", "")).strip().lower() != str(system_type).strip().lower():
+            continue
+        if (not include_restored) and bool(r.get("archive_restored")):
+            continue
+        out.append(r)
+    out.sort(key=lambda x: str(x.get("archived_at", "")), reverse=True)
+    return out
+
+
+def mark_deleted_archive_restored(archive_id: str, restored_by: str = "", restore_target_status: str = "") -> bool:
+    archive_id = str(archive_id or "").strip()
+    if not archive_id:
+        return False
+    rows = load_json_cache(DELETED_ARCHIVE_JSON.name, default=[])
+    if not isinstance(rows, list):
+        return False
+    changed = False
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        current = dict(row)
+        current.setdefault("archive_id", _archive_identity(current))
+        if str(current.get("archive_id", "")).strip() != archive_id:
+            rows[i] = current
+            continue
+        current["archive_restored"] = True
+        current["restored_at"] = datetime.now().isoformat(timespec="seconds")
+        current["restored_by"] = str(restored_by or "").strip().lower()
+        current["restore_target_status"] = str(restore_target_status or "").strip().lower()
+        rows[i] = current
+        changed = True
+        break
+    if changed:
+        save_json_cache(DELETED_ARCHIVE_JSON.name, rows)
+        try:
+            df = pd.DataFrame(rows)
+            with pd.ExcelWriter(DELETED_ARCHIVE_XLSX, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="deleted_archive", index=False)
+        except Exception:
+            pass
+    return changed
 
 def load_backup_sheet_df(sheet_name: str, filename: str = "cloud_backup.xlsx") -> pd.DataFrame:
     path = _cache_path(filename)
@@ -171,9 +289,22 @@ def remove_record_attachments(record_key: str) -> None:
 def queue_pending_sync(operation: str, actor: Dict[str, Any], payload: Dict[str, Any], queue_owner_email: Optional[str] = None) -> None:
     owner_email = str(queue_owner_email or actor.get("email") or payload.get("user_email") or "").strip().lower()
     queue = load_pending_sync_queue(owner_email)
+    payload = dict(payload or {})
     record_id = str(payload.get('record_id') or '').strip()
     queued_at = datetime.now().isoformat(timespec='seconds')
+    event_id = str(payload.get('event_id') or uuid.uuid4().hex).strip()
+    payload['event_id'] = event_id
+    if payload.get('expected_version') is None and payload.get('base_version') is None:
+        ver_raw = payload.get('version')
+        try:
+            if ver_raw not in (None, ''):
+                ver_num = int(ver_raw)
+                payload['expected_version'] = ver_num
+                payload['base_version'] = ver_num
+        except Exception:
+            pass
     item = {
+        'event_id': event_id,
         'operation': operation,
         'actor': actor,
         'payload': payload,
@@ -207,6 +338,58 @@ def load_pending_sync_queue(email: Optional[str] = None) -> List[Dict[str, Any]]
 def save_pending_sync_queue(queue: List[Dict[str, Any]], email: Optional[str] = None) -> None:
     path = _pending_queue_path(email)
     _atomic_write_json(path, queue)
+
+
+def remove_pending_sync_item(owner_email: str, event_id: str = '', record_id: str = '', system_type: Optional[str] = None) -> int:
+    queue = load_pending_sync_queue(owner_email)
+    newq = []
+    removed = 0
+    for item in queue:
+        payload = dict(item.get('payload') or {})
+        item_event = str(item.get('event_id') or payload.get('event_id') or '').strip()
+        item_record = str(payload.get('record_id') or '').strip()
+        item_system = payload.get('system_type') or ('travel' if 'travel' in str(item.get('operation', '')).lower() else 'expense')
+        matched = False
+        if event_id and item_event == str(event_id).strip():
+            matched = True
+        elif record_id and item_record == str(record_id).strip() and (not system_type or item_system == system_type):
+            matched = True
+        if matched:
+            removed += 1
+            continue
+        newq.append(item)
+    if removed:
+        save_pending_sync_queue(newq, owner_email)
+    return removed
+
+
+def update_pending_sync_item(owner_email: str, event_id: str, new_item: Dict[str, Any]) -> bool:
+    queue = load_pending_sync_queue(owner_email)
+    changed = False
+    for i, item in enumerate(queue):
+        payload = dict(item.get('payload') or {})
+        item_event = str(item.get('event_id') or payload.get('event_id') or '').strip()
+        if item_event == str(event_id).strip():
+            queue[i] = new_item
+            changed = True
+            break
+    if changed:
+        save_pending_sync_queue(queue, owner_email)
+    return changed
+
+
+def list_pending_conflicts(owner_email: str, system_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for item in load_pending_sync_queue(owner_email):
+        payload = dict(item.get('payload') or {})
+        item_system = payload.get('system_type') or ('travel' if 'travel' in str(item.get('operation', '')).lower() else 'expense')
+        if system_type and item_system != system_type:
+            continue
+        status = str(payload.get('sync_status') or '').strip().lower()
+        last_error = str(item.get('last_error') or payload.get('sync_message') or '')
+        if status == 'conflict' or 'VERSION_CONFLICT' in last_error or payload.get('sync_conflict'):
+            rows.append(item)
+    return rows
 
 
 def save_signature_file(owner_email: str, uploaded_file: Any) -> Dict[str, Any]:
@@ -391,6 +574,19 @@ def upsert_local_travel_record(email: str, payload: Dict[str, Any]) -> str:
     return record_id
 
 
+
+
+def delete_local_travel_record(email: str, record_id: str) -> None:
+    rows = _read_json_list(TRAVEL_RECORDS_FILE)
+    email = str(email or "").strip().lower()
+    out = []
+    for row in rows:
+        same = str(row.get("record_id") or "") == str(record_id or "") and str(row.get("user_email") or "").strip().lower() == email
+        if not same:
+            out.append(row)
+    _write_json_list(TRAVEL_RECORDS_FILE, out)
+
+
 def mark_local_travel_status(email: str, record_id: str, status: str) -> None:
     rows = _read_json_list(TRAVEL_RECORDS_FILE)
     email = str(email or "").strip().lower()
@@ -446,6 +642,13 @@ def mark_sync_success(owner_email: str, system_type: str, record_id: str) -> Non
         item_system = payload.get('system_type') or ('travel' if 'travel' in str(item.get('operation','')).lower() else 'expense')
         item_rid = str(payload.get('record_id') or '').strip()
         if item_system == system_type and item_rid == rid:
+            append_sync_audit({
+                'event_type': 'sync_success',
+                'record_id': rid,
+                'system_type': system_type,
+                'queue_owner_email': owner_email,
+                'event_id': item.get('event_id', ''),
+            })
             continue
         newq.append(item)
     save_pending_sync_queue(newq, owner_email)
@@ -464,7 +667,17 @@ def mark_sync_failed(owner_email: str, system_type: str, record_id: str, message
             payload['sync_status'] = 'failed'
             payload['sync_message'] = message or '同步失敗'
             item['payload'] = payload
+            item['retry_count'] = int(item.get('retry_count') or 0) + 1
+            item['last_error'] = message or '同步失敗'
             changed = True
+            append_sync_audit({
+                'event_type': 'sync_failed',
+                'record_id': rid,
+                'system_type': system_type,
+                'queue_owner_email': owner_email,
+                'event_id': item.get('event_id', ''),
+                'message': message or '同步失敗',
+            })
     if changed:
         save_pending_sync_queue(queue, owner_email)
 
